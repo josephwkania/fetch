@@ -1,8 +1,16 @@
 # What the predict.py rewrite changed
 
-Measured on a Tesla T4 (sm_75, 70 W, a 1590 MHz boost it cannot hold), tf-keras
-2.19 on TensorFlow 2.19, Python 3.12, against 6,400 candidate h5s. Those are
-stand-ins, not sky: the production run's own cutouts went with an ephemeral
+Measured on a Tesla T4 (sm_75, 70 W, a 1590 MHz boost it cannot hold).
+
+The headline results are in "On real candidates" below: 18,618 cutouts of two
+pulsars, made by the pipeline itself and classified in its own container on
+Keras 2.14. The sections before that are the earlier work on generated
+stand-ins, kept because the mechanism is easier to see there and because the
+runtime comparison needed a fixed set -- but where the two disagree, the real
+candidates are the answer.
+
+The stand-ins: 6,400 h5s, tf-keras 2.19 on TensorFlow 2.19, Python 3.12. Not
+sky: the production run's own cutouts went with an ephemeral
 disk, so they were generated as Gaussian noise with a crude dispersed pulse
 injected, written the way `your_candmaker.py` writes them -- two 256x256 float32
 planes, gzip-9, the same attributes. They average 228 kB against the run's
@@ -55,7 +63,61 @@ earlier gain from a larger batch was the per-call dispatch cost being spread
 over more candidates, and the rewrite removes that cost rather than amortising
 it.
 
-## The probabilities move, slightly
+## On real candidates
+
+The numbers above were taken on generated stand-ins. The pipeline has since
+been run end to end on two pulsars, and everything below is from those: 8,484
+cutouts of PSR J0358 and 10,134 of PSR J1705, made by `your_candmaker.py` and
+classified in the pipeline's own container, which carries Keras 2.14.
+
+### Timing
+
+Seven models over one pass against seven separate runs, same files, same four
+cores:
+
+| | upstream, 7 runs | rewrite, 1 pass | |
+| --- | --- | --- | --- |
+| J0358, Keras 2.14 | 1126 s | 728 s | 1.55x |
+| J1705, Keras 2.14 | 1361 s | 857 s | 1.59x |
+| J0358, tf-keras 2.19 | 898 s | 710 s | 1.26x |
+| J1705, tf-keras 2.19 | 1128 s | 844 s | 1.34x |
+
+Per candidate the rewrite costs 83-86 ms in both runtimes, while upstream costs
+133 ms on 2.14 and 106-111 ms on 2.19. The rewrite is runtime-independent
+because it is no longer paying framework overhead per model, which is why the
+gain is larger on the runtime the pipeline actually runs.
+
+Upstream's per-model times vary by only a few per cent -- 153 to 167 s on
+J0358 -- while the models differ by a factor of four in arithmetic. A stage
+whose cost is blind to the work it does is not compute-bound; it is paying to
+read the same 8,484 cutouts seven times.
+
+### The probabilities still move, and the real margins are tight
+
+Rewrite against upstream, same runtime, every model, all 18,618 candidates:
+the largest disagreement is 6.7e-06 and **no candidate changes label**, across
+260,652 comparisons.
+
+But the headroom is nothing like what the generated set suggested. Taking the
+closest candidate to the 0.5 threshold in each model's real results, against
+that model's measured shift:
+
+| | closest p to 0.5 | shift | ratio |
+| --- | --- | --- | --- |
+| J1705, model k | 3.70e-05 | 5.95e-06 | **6.2x** |
+| J1705, model f | 5.03e-05 | 4.70e-06 | 10.7x |
+| J0358, model f | 1.06e-04 | 6.72e-06 | 15.8x |
+| J0358, model a | 7.02e-04 | 4.00e-07 | 1755x |
+
+On generated noise the same calculation gave 74,400x to 6,800,000x, because
+the classifier is confident there and almost nothing lands near the threshold.
+On real sky the worst case is six. Nothing flipped here, and no candidate sits
+within one shift of the threshold in either run -- but the production J1705
+results contain a candidate 1.04e-06 from it, which is inside one shift. "No
+labels changed" is a measurement of these 18,618 candidates, not a guarantee
+for the next set.
+
+## The first measurements, on generated stand-ins
 
 Every model, all 6,400 candidates, tip against upstream:
 
@@ -147,6 +209,36 @@ So for a, c and k the shift is systematic and reproducible; for b, d, e and f it
 is partly systematic and partly which process happened to run. Neither cause is
 close to large enough to move a label.
 
+## The pod is slower than the same container, and it is one variable
+
+The classification stage takes far longer as a Kubernetes Job than the same
+image does by hand on the same four cores: 369 s against 160 s for one model
+over the 8,484 J0358 cutouts. The cause is not the container, the storage or
+the card. `limits: {cpu: "4"}` becomes a CFS quota -- 400 ms of CPU per 100 ms
+period -- while `--cpuset-cpus 0-3` is four whole cores, and `predict.py`
+oversubscribes badly: each of its reader processes starts as many OpenMP
+threads as the host has CPUs, because a cgroup limit does not change what the
+kernel reports. Those threads burn the quota early in each period and then all
+stall until it refills.
+
+Measured, same model and cutouts, all under `--cpus=4`:
+
+| | seconds |
+| --- | --- |
+| as the stage runs it (`-n 4`) | 354 |
+| `-n 2` | 360 |
+| `-n 1` | 246 |
+| `-n 4`, `OMP_NUM_THREADS=1` | **91** |
+| `-n 4`, OpenMP and both TensorFlow pools capped | 86 |
+| `-n 1`, all capped | 99 |
+| for reference, `--cpuset-cpus=0-3`, `-n 4` | 160 |
+
+The reader count is not the variable: `-n 2` is no better than `-n 4`.
+`OMP_NUM_THREADS=1` alone accounts for almost all of it, taking the stage from
+354 s to 91 s -- faster than four dedicated cores, because the oversubscription
+was costing more than the fourth core was worth. This is a ConfigMap change,
+and it compounds with the rewrite rather than overlapping with it.
+
 ## What this does not cover
 
 - **Half precision.** Everything here is fp32 on the CUDA cores. The T4's tensor
@@ -156,8 +248,11 @@ close to large enough to move a label.
   it needs this same label comparison before it could be trusted.
 - **Scale.** The production stage classified 30,527 candidates; 6,400 is the
   largest stand-in set built here.
-- **Real cutouts.** Every number above was taken on generated candidates. The
-  timings carry over; the probability margins do not, as the table above shows.
+- **The threshold.** Nothing flipped across 260,652 real comparisons, but the
+  worst margin is a factor of six and the production results hold a candidate
+  inside one shift. A change that perturbs probabilities further -- half
+  precision, a different card, a newer cuDNN -- needs this comparison run
+  again rather than inheriting its conclusion.
 - **The runtime the pipeline actually used.** That image carried Keras 2.14 and
   went with the ephemeral disk. Every comparison here is tf-keras 2.19, and the
   mechanisms involved are version-specific.
