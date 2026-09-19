@@ -22,12 +22,10 @@ needs_weights = pytest.mark.skipif(
 
 
 def run_predict(data_dir, args):
-    env = dict(
-        os.environ,
-        PYTHONPATH=str(REPO),
-        TF_USE_LEGACY_KERAS="1",
-        TF_CPP_MIN_LOG_LEVEL="3",
-    )
+    # TF_USE_LEGACY_KERAS is deliberately not set: predict.py has to pick its
+    # own Keras, or an install from requirements.txt cannot load the models.
+    env = dict(os.environ, PYTHONPATH=str(REPO), TF_CPP_MIN_LOG_LEVEL="3")
+    env.pop("TF_USE_LEGACY_KERAS", None)
     return subprocess.run(
         [sys.executable, str(REPO / "bin" / "predict.py"),
          "--data_dir", str(data_dir), "-g", "-1"] + args,
