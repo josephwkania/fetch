@@ -8,7 +8,7 @@ setup(
     package_dir={"fetch": "fetch"},
     package_data={"fetch": ["models/model_list.csv", "models/*/*"]},
     url="https://github.com/devanshkv/fetch",
-    tests_require=["pytest", "pytest-cov"],
+    extras_require={"tests": ["pytest", "pytest-timeout"]},
     license="GNU General Public License v3.0",
     author=["Devansh Agarwal", "Kshitij Aggarwal"],
     author_email=["devansh.kv@gmail.com", "ka0064@mix.wvu.edu"],
